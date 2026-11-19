@@ -3,4 +3,5 @@
  * HTTPS URL of your FastAPI backend. Do NOT place your bot token here.
  * Example: https://your-tunnel.trycloudflare.com
  */
-window.BLOCKBENCH_TELEGRAM_API_URL = '';
+window.BLOCKBENCH_TELEGRAM_API_URL = 'https://blockbench-png-api.vercel.app';
+
