@@ -1,56 +1,64 @@
 import './config.js';
 
-/** A small built-in Blockbench plugin. Loaded only by your fork. */
+// Custom Blockbench menu action: send the selected skin texture as a lossless PNG.
 (() => {
-  const PLUGIN_ID = 'telegram_model_export';
+  const PLUGIN_ID = 'telegram_png_skin_export';
   let menu = null;
   let uploadAction = null;
   let busy = false;
 
   function notice(message) {
-    window.Blockbench?.showQuickMessage?.(message, 4000);
-    console.log('[Telegram Export]', message);
+    window.Blockbench?.showQuickMessage?.(message, 4500);
+    console.log('[Telegram PNG]', message);
   }
 
-  async function sendModel() {
+  async function sendSkin() {
     if (busy) return;
-    if (!window.Project || !window.Codecs?.project) {
-      notice('Сначала создай или открой модель');
+
+    const texture = window.Texture?.selected || window.Texture?.all?.[0];
+    if (!window.Project || !texture) {
+      notice('Сначала открой скин или создай текстуру');
       return;
     }
-    const apiBase = String(window.BLOCKBENCH_TELEGRAM_API_URL || '').replace(/\/$/, '');
+
+    const apiBase = String(window.BLOCKBENCH_TELEGRAM_API_URL || '')
+      .replace(/\/$/, '');
     if (!/^https:\/\//.test(apiBase)) {
-      notice('Укажи HTTPS API в telegram/config.js');
+      notice('Не настроен адрес сервера в telegram/config.js');
       return;
     }
+
     const initData = window.Telegram?.WebApp?.initData;
     if (!initData) {
-      notice('Для загрузки открой редактор через Telegram Mini App');
+      notice('Открой Blockbench через ссылку Telegram Mini App');
       return;
     }
+
     busy = true;
     try {
-      // The Blockbench .bbmodel codec includes geometry, UV and embedded textures.
-      const model = window.Codecs.project.compile({ raw: true, bitmaps: true });
-      const response = await fetch(`${apiBase}/api/models`, {
+      // Blockbench's getDataURL() returns an image/png;base64 Data URL.
+      const imageData = texture.getDataURL();
+      if (!imageData.startsWith('data:image/png;base64,')) {
+        throw new Error('Не удалось получить PNG-текстуру');
+      }
+
+      const response = await fetch(`${apiBase}/api/skins`, {
         method: 'POST',
-        mode: 'cors',
-        headers: {
-          'Content-Type': 'application/json',
-          // Useful for ngrok's free browser warning; ignored by FastAPI.
-          'ngrok-skip-browser-warning': 'true',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           initData,
-          filename: `${String(window.Project.name || 'model').slice(0, 80)}.bbmodel`,
-          model,
+          filename: `${texture.name || 'skin'}.png`,
+          imageData
         }),
       });
+
       const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
-      notice(`Модель сохранена! ID: ${result.id}`);
+      if (!response.ok) {
+        throw new Error(result.detail || `Ошибка HTTP ${response.status}`);
+      }
+      notice('PNG-скин отправлен в Telegram!');
     } catch (error) {
-      console.error('[Telegram Export]', error);
+      console.error(error);
       notice(`Ошибка отправки: ${error.message}`);
     } finally {
       busy = false;
@@ -60,25 +68,23 @@ import './config.js';
   function register() {
     if (!window.Blockbench?.setup_successful || !window.Plugin ||
         !window.Plugins || !window.MenuBar || !window.BarMenu ||
-        !window.Action || !window.Codecs?.project) return false;
+        !window.Action || !window.Texture) return false;
     if (window.Plugins.registered[PLUGIN_ID]) return true;
 
-    // Blockbench's Plugin.register expects a registered instance. Since this
-    // plugin is bundled into our own web build (not sideloaded), create one.
+    // Plugin.register requires a previously instantiated plugin scope.
     const instance = new window.Plugin(PLUGIN_ID, { installed: true });
     window.Plugins.registered[PLUGIN_ID] = instance;
-
     window.Plugin.register(PLUGIN_ID, {
-      title: 'Telegram Export',
-      author: 'Telegram Blockbench Kit',
-      description: 'Send the current .bbmodel to your HTTPS API.',
+      title: 'Telegram PNG Skins',
+      author: 'Telegram Blockbench',
+      description: 'Send selected PNG skin to the bot owner.',
       version: '1.0.0',
       variant: 'web',
       onload() {
-        uploadAction = new window.Action('telegram_send_model', {
-          name: 'Отправить модель на сервер',
+        uploadAction = new window.Action('telegram_send_png', {
+          name: 'Отправить PNG-скин в Telegram',
           icon: 'cloud_upload',
-          click: sendModel,
+          click: sendSkin,
         });
         menu = new window.BarMenu('telegram_send_menu', [uploadAction], {
           name: 'Telegram',
@@ -96,13 +102,11 @@ import './config.js';
     return true;
   }
 
-  // Blockbench's module bundle initializes asynchronously. Wait until it
-  // exposes its plugin and menu globals instead of racing bundle startup.
   let attempts = 0;
   const poll = setInterval(() => {
     if (register() || ++attempts > 300) {
       clearInterval(poll);
-      if (attempts > 300) console.error('Telegram plugin could not initialize');
+      if (attempts > 300) console.error('PNG plugin failed to initialize');
     }
   }, 100);
 })();
