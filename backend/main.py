@@ -191,6 +191,7 @@ async def send_skin(request: Request):
     if message_id is not None:
         caption = (
             f"🎨 Новый PNG-скин из Blockbench\n"
+            f"👤 Отправитель: Telegram ID {sender_id}\n"
             f"📁 {filename} | {len(png)} байт\n"
             f"🖌 Обработка: {processing_time:.3f} сек\n"
             f"📤 Telegram API: {telegram_time:.3f} сек\n"
