@@ -1,100 +1,143 @@
-"""Minimal authenticated Blockbench model storage API for Telegram Mini Apps."""
+"""Receive an authenticated Blockbench PNG and forward it to bot owner's DM."""
+import base64
+import binascii
 import hashlib
 import hmac
+import io
 import json
 import os
+import re
 import time
-import uuid
-from pathlib import Path
 from urllib.parse import parse_qsl
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-CORS_ORIGINS = [s.strip().rstrip('/') for s in os.environ.get(
-    'CORS_ORIGINS', 'http://localhost:3000'
-).split(',') if s.strip()]
-ALLOWED_USER_IDS = {int(x) for x in os.environ.get('ALLOWED_USER_IDS', '').split(',') if x.strip().isdigit()}
-MAX_BYTES = 25 * 1024 * 1024
-DATA_DIR = Path(__file__).with_name('saved_models')
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
+CORS_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "CORS_ORIGINS", "https://blockbench-editor.vercel.app"
+    ).split(",")
+    if origin.strip()
+]
+# Optional: restrict uploads to your own / your friend's Telegram user IDs.
+ALLOWED_USER_IDS = {
+    int(value) for value in os.getenv("ALLOWED_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+MAX_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_PNG_BYTES = 2 * 1024 * 1024
 
-app = FastAPI(title='Telegram Blockbench API')
+app = FastAPI(title="Blockbench PNG Telegram delivery")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
-    allow_methods=['GET', 'POST', 'OPTIONS'],
-    allow_headers=['Content-Type', 'ngrok-skip-browser-warning'],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 
-def verify_telegram_init_data(raw: str) -> dict:
-    """Telegram Mini Apps HMAC validation (not login-widget verification)."""
-    if not BOT_TOKEN or BOT_TOKEN == 'PASTE_YOUR_BOT_TOKEN_HERE':
-        raise HTTPException(500, 'Server BOT_TOKEN is not configured')
-    if not isinstance(raw, str) or len(raw) > 20_000:
-        raise HTTPException(401, 'Missing or invalid Telegram initData')
+def verify_init_data(raw: str) -> int:
+    """Validate the Telegram Mini App's signed initData on the server."""
+    if not BOT_TOKEN or not OWNER_CHAT_ID:
+        raise HTTPException(503, "Server is not configured")
+    if not isinstance(raw, str) or not raw or len(raw) > 20_000:
+        raise HTTPException(401, "Missing Telegram authentication")
+
     try:
-        fields = parse_qsl(raw, keep_blank_values=True, strict_parsing=True)
-    except ValueError:
-        raise HTTPException(401, 'Malformed Telegram initData')
-    data = dict(fields)
-    if len(data) != len(fields):
-        raise HTTPException(401, 'Duplicate initData field')
-    their_hash = data.pop('hash', None)
-    if not their_hash:
-        raise HTTPException(401, 'Missing Telegram signature')
-    check_string = '\n'.join(f'{k}={v}' for k, v in sorted(data.items()))
-    secret = hmac.new(b'WebAppData', BOT_TOKEN.encode('utf-8'), hashlib.sha256).digest()
-    calculated = hmac.new(secret, check_string.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calculated, their_hash):
-        raise HTTPException(401, 'Invalid Telegram signature')
-    try:
-        auth_date = int(data['auth_date'])
-    except (ValueError, TypeError, KeyError):
-        raise HTTPException(401, 'Invalid auth_date')
+        pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=True)
+        fields = dict(pairs)
+        if len(fields) != len(pairs):
+            raise ValueError("Duplicate fields")
+        received_hash = fields.pop("hash")
+        auth_date = int(fields["auth_date"])
+        user_id = int(json.loads(fields["user"])["id"])
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        raise HTTPException(401, "Invalid Telegram authentication")
+
+    check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    expected = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, received_hash.lower()):
+        raise HTTPException(401, "Invalid Telegram signature")
+
     now = int(time.time())
-    if auth_date < now - 24 * 3600 or auth_date > now + 60:
-        raise HTTPException(401, 'Expired Telegram authorization')
-    try:
-        user = json.loads(data['user'])
-        user_id = int(user['id'])
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-        raise HTTPException(401, 'Missing Telegram user ID')
+    if auth_date < now - 86400 or auth_date > now + 60:
+        raise HTTPException(401, "Expired Telegram authentication")
     if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        raise HTTPException(403, 'Not allowed to upload')
-    return {'user_id': user_id}
+        raise HTTPException(403, "This Telegram user is not allowed to upload")
+    return user_id
 
 
-@app.get('/health')
-def health():
-    return {'ok': True}
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 
-@app.post('/api/models')
-async def save_model(request: Request):
-    # Enforce a size limit while reading (even when no Content-Length is sent).
+@app.post("/api/skins")
+async def send_skin(request: Request):
     chunks = []
-    total = 0
+    size = 0
     async for chunk in request.stream():
-        total += len(chunk)
-        if total > MAX_BYTES:
-            raise HTTPException(413, 'Model payload exceeds 25 MB')
+        size += len(chunk)
+        if size > MAX_REQUEST_BYTES:
+            raise HTTPException(413, "Request too large")
         chunks.append(chunk)
+
     try:
-        payload = json.loads(b''.join(chunks))
-    except (ValueError, UnicodeDecodeError):
-        raise HTTPException(400, 'Expected JSON body')
+        payload = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, ValueError):
+        raise HTTPException(400, "Invalid JSON request")
     if not isinstance(payload, dict):
-        raise HTTPException(400, 'Expected a JSON object')
-    identity = verify_telegram_init_data(payload.get('initData', ''))
-    model = payload.get('model')
-    if not isinstance(model, dict) or not isinstance(model.get('meta'), dict):
-        raise HTTPException(400, 'Expected a .bbmodel JSON object')
-    model_id = uuid.uuid4().hex
-    # Never trust a client-chosen file path. Save under a random filename.
-    path = DATA_DIR / f'{model_id}.bbmodel'
-    path.write_text(json.dumps(model, ensure_ascii=False), encoding='utf-8')
-    return {'ok': True, 'id': model_id, 'user_id': identity['user_id']}
+        raise HTTPException(400, "Invalid JSON body")
+
+    sender_id = verify_init_data(payload.get("initData"))
+    image_data = payload.get("imageData")
+    if not isinstance(image_data, str) or not image_data.startswith(
+        "data:image/png;base64,"
+    ):
+        raise HTTPException(400, "Expected a PNG data URL")
+
+    try:
+        png = base64.b64decode(image_data.split(",", 1)[1], validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Invalid PNG encoding")
+    if (len(png) < 24 or len(png) > MAX_PNG_BYTES or
+            not png.startswith(b"\x89PNG\r\n\x1a\n") or
+            png[12:16] != b"IHDR"):
+        raise HTTPException(400, "Invalid or oversized PNG file")
+
+    width = int.from_bytes(png[16:20], "big")
+    height = int.from_bytes(png[20:24], "big")
+    if not (1 <= width <= 4096 and 1 <= height <= 4096):
+        raise HTTPException(400, "Invalid PNG dimensions")
+
+    raw_filename = str(payload.get("filename") or "skin.png")
+    safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_filename.rsplit(".", 1)[0])[:60]
+    filename = (safe_stem or "skin") + ".png"
+
+    # sendDocument keeps the original skin PNG instead of recompressing it as a photo.
+    # Use POST multipart/form-data; never expose BOT_TOKEN to frontend.
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={
+                    "chat_id": OWNER_CHAT_ID,
+                    "caption": f"Новый PNG-скин из Blockbench (от Telegram ID {sender_id})",
+                },
+                files={"document": (filename, io.BytesIO(png), "image/png")},
+            )
+            answer = response.json()
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(502, "Telegram delivery failed")
+
+    if not response.is_success or answer.get("ok") is not True:
+        # Do not return private bot configuration or Telegram API details.
+        raise HTTPException(502, "Bot could not send the file. Start the bot and check OWNER_CHAT_ID.")
+
+    return {"ok": True, "filename": filename}
